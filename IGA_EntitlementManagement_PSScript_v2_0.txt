@@ -1,0 +1,797 @@
+############################################################
+#  Permission prerequisites for Service principal are below:
+#  EntitlementManagement.ReadWrite.All
+#  Group.ReadWrite.All
+###############################################################
+
+
+#############################################
+# The below Role Ids are constant values:-
+# ##################################################################  Catalog-Owner  ###########################################################################################################
+# Privileges: they can create, manage catalogs, Add resources to catalog, assign roles to resources and manage assignments.
+# Restrictions: Limited to assigned catalogs, cannot modify global settings or configurations outside their assigned catalogs and cannot assign administrative roles outside the scope of the catalog.
+$roleidCatalogowner = "ae79f266-94d4-4dab-b730-feca7e132178"
+
+# ##################################################################  Catalog-Reader  ###########################################################################################################
+# Privileges: They can read the configuration in Catalog and associated resources like Access package, audit logs related to catalog activities etc.
+# Restrictions: No Modification, Assignment rights and all actions are restrcited to viewing information only, no changes can be made.
+$roleidCatalogreader = "44272f93-9762-48e8-af59-1b5351b1d6b3"
+
+# ##################################################################  Access Package-Manager  ########################################################################################################### 
+# Privileges: They can manage access packages, assign access and can configure and manage approval workflow for access requests.
+# Restrictions: They cannot add resources to catalogs, their capabilities are restricted to catalogs they have been assigned to manage and cannot assign roles within the catalog to other users.
+$roleidAccesspackagemanager = "7f480852-ebdc-47d4-87de-0d8498384a83"
+
+# ##################################################################  Access Package Assignment Manager  ###########################################################################################################
+# Privileges: They can View Assignment, Add Assignments, Remove assignments and manage assignment settings such as duration of access and any required approvals etc.
+# Restrictions: They cannot create or manage access packages, add resources or remove resources to catalogs, and cannot bypass the approvals when assigning users to access package which requires approvals.
+$roleidAccesspackageassignmentmanager = "e2182095-804a-4656-ae11-64734e9b7ae5"
+
+######################################################
+### Credentials to connect with MS Graph Powershell###
+######################################################
+
+
+Import-Module Microsoft.Graph.Identity.Governance
+Import-Module Microsoft.Graph.Groups
+Import-Module Microsoft.Graph.Users
+$clientID=<-------Client ID -------------->
+$tenantID=<---------Tenant ID --------->
+$clientSecret=<-----Secret Value ------>
+
+###########################################################################
+#### App SPN is used to assign as an owner of resources under the catalogs
+###########################################################################
+$appServicePrincipal = "bc5f01d3-65f5-4b7a-97f8-938ca445c108"
+
+$secureClientSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+$clientSecretCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $clientID, $secureClientSecret
+Connect-MgGraph -TenantId $tenantID  -ClientSecretCredential $clientSecretCredential -NoWelcome
+
+ function GetObjectByName
+ {
+    param (
+        [string]$ObjectName
+    )
+    
+    $user = Get-MgUser -Filter "userPrincipalName eq '$ObjectName'" -ErrorAction SilentlyContinue | Select -ExpandProperty Id
+    if ($user) { 
+              return $user
+        }
+        
+
+    # Search for group
+    $group = Get-MgGroup -Filter "DisplayName eq '$ObjectName'" -ErrorAction SilentlyContinue | Select -ExpandProperty Id
+    if ($group) {
+          return $group
+        }
+    return $null
+ 
+ }
+
+ function Get-ApproverInfo
+ {
+    param(
+           [hashtable]$pparam,
+           [hashtable]$ApprObj
+        )
+    If($ApprObj.Approver1 -ne '')
+    {
+        #Setting Primary Approver to policyParam variable.
+        If($ApprObj.Approver1 -eq "Manager")
+        {
+            $pparam.requestApprovalSettings.stages[0].primaryApprovers += @(
+	                   @{
+                            #Set Manager as an approver without specifying object Id
+	                   	    "@odata.type" = "#microsoft.graph.requestorManager"
+	                   	    "managerLevel" = 1
+	                   }
+	              )
+        }
+        elseIf($ApprObj.Approver1 -like "*.OnMicrosoft.com")
+        {
+            # Assuming approver1 is User if it is not manager and contains 'onmicrosoft.com'
+            $tempApproverId = GetObjectByName -ObjectName $ApprObj.Approver1 
+            
+            $pparam.requestApprovalSettings.stages[0].primaryApprovers += @(
+	                   @{
+                            #Set Approver based on mentioned on CSV file.
+	                    	"@odata.type" = "#microsoft.graph.singleUser"
+	                		userId = $tempApproverId
+	                   }
+	              )
+        }
+        else{
+            # Assuming Approver1 is Group object if it is not UPN value or Manager
+            $tempApproverId = GetObjectByName -ObjectName $ApprObj.Approver1 
+            $pparam.requestApprovalSettings.stages[0].primaryApprovers += @(
+	                   @{
+                            #Set Approver based on mentioned on CSV file.
+	                    	"@odata.type" = "#microsoft.graph.groupMembers"
+	                		groupId = $tempApproverId
+	                   }
+	              )
+        }
+
+        #if Fallback approver exist for approval.
+        If($ApprObj.defaultFallbackApprover -ne '')
+        {
+           If($ApprObj.defaultFallbackApprover -like "*.OnMicrosoft.com")
+           {
+               # Assuming fallback approver is User and contains 'onmicrosoft.com'
+               $tempFBackAppr = GetObjectByName -ObjectName $ApprObj.defaultFallbackApprover 
+               $pparam.requestApprovalSettings.stages[0].fallbackPrimaryApprovers += @(
+	                      @{
+                               #Set fallaback Approver based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.singleUser"
+	                   		userId = $tempFBackAppr
+	                      }
+	                 )
+           }
+           else{
+               # Assuming Approver1 is Group object if it is not UPN value or Manager
+               $tempFBackAppr = GetObjectByName -ObjectName $ApprObj.defaultFallbackApprover 
+               $pparam.requestApprovalSettings.stages[0].fallbackPrimaryApprovers += @(
+	                      @{
+                               #Set Approver based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.groupMembers"
+	                   		groupId = $tempFBackAppr
+	                      }
+	                 )
+           }
+        }
+     }
+     #if Secondry approver exist for Multi-level approval.
+     If($ApprObj.Approver2 -ne '' -and $ApprObj.ApprovalScope -eq "Multi-level")
+     {
+        $tempApproverId = $null
+        If($ApprObj.Approver2 -eq "Manager")
+        {
+            $pparam.requestApprovalSettings.stages[1].primaryApprovers += @(
+	                   @{
+                            #Set Manager as an approver without specifying object Id
+	                   	    "@odata.type" = "#microsoft.graph.requestorManager"
+	                   	    "managerLevel" = 1
+	                   }
+	              )
+        }
+        elseIf($ApprObj.Approver2 -like "*.OnMicrosoft.com")
+        {
+            # Assuming approver1 is User if it is not manager and contains 'onmicrosoft.com'
+            $tempApproverId = GetObjectByName -ObjectName $ApprObj.Approver2 
+            $pparam.requestApprovalSettings.stages[1].primaryApprovers += @(
+	                   @{
+                            #Set Approver based on mentioned on CSV file.
+	                    	"@odata.type" = "#microsoft.graph.singleUser"
+	                		userId = $tempApproverId
+	                   }
+	              )
+        }
+        else{
+            # Assuming Approver1 is Group object if it is not UPN value or Manager
+            $tempApproverId = GetObjectByName -ObjectName $ApprObj.Approver2 
+            $pparam.requestApprovalSettings.stages[1].primaryApprovers += @(
+	                   @{
+                            #Set Approver based on mentioned on CSV file.
+	                    	"@odata.type" = "#microsoft.graph.groupMembers"
+	                		groupId = $tempApproverId
+	                   }
+	              )
+        }
+
+        #if Fallback approver exist for approval.
+        If($ApprObj.defaultFallbackApprover -ne '')
+        {
+           If($ApprObj.defaultFallbackApprover -like "*.OnMicrosoft.com")
+           {
+               # Assuming fallback approver is User and contains 'onmicrosoft.com'
+               $tempFBackAppr = GetObjectByName -ObjectName $ApprObj.defaultFallbackApprover 
+               $pparam.requestApprovalSettings.stages[1].fallbackPrimaryApprovers += @(
+	                      @{
+                               #Set fallaback Approver based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.singleUser"
+	                   		userId = $tempFBackAppr
+	                      }
+	                 )
+           }
+           else{
+               # Assuming Approver1 is Group object if it is not UPN value or Manager
+               $tempFBackAppr = GetObjectByName -ObjectName $ApprObj.defaultFallbackApprover 
+               $pparam.requestApprovalSettings.stages[1].fallbackPrimaryApprovers += @(
+	                      @{
+                               #Set Approver based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.groupMembers"
+	                   		groupId = $tempFBackAppr
+	                      }
+	                 )
+           }
+        }
+     }
+     # Set Reviewer value in policy parameter.
+      If($ApprObj.accessPolicyReviewer -ne '' -and ($ApprObj.ApprovalScope -eq "Multi-level" -or $ApprObj.ApprovalScope -eq "Single-level"))
+        {
+           If($ApprObj.accessPolicyReviewer -eq "Manager" -and $ApprObj.reviewerFallback -ne '')
+           {
+               $pparam.reviewSettings.primaryReviewers += @(
+	                      @{
+                               #Set Manager as an reviewer without specifying object Id
+	                      	    "@odata.type" = "#microsoft.graph.targetManager"
+	                      	    "managerLevel" = 1
+	                      }
+	                 )
+           }
+           elseIf($ApprObj.accessPolicyReviewer -like "*.OnMicrosoft.com")
+           {
+               # Assuming Reviewer is User and contains 'onmicrosoft.com'
+               $tempAccessReviewerId = GetObjectByName -ObjectName $ApprObj.accessPolicyReviewer 
+               $pparam.reviewSettings.primaryReviewers += @(
+	                      @{
+                               #Set Reviewer based on mentioned on CSV file.
+	                       	   "@odata.type" = "#microsoft.graph.singleUser"
+	                   		   userId = $tempAccessReviewerId
+	                      }
+	                 )
+           }
+           else{
+               # Assuming Access Reviewer is Group object if it is not UPN value or Manager
+               $tempAccessReviewerId = GetObjectByName -ObjectName $ApprObj.accessPolicyReviewer 
+               $pparam.reviewSettings.primaryReviewers += @(
+	                      @{
+                               #Set Reviewer based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.groupMembers"
+	                   		groupId = $tempAccessReviewerId
+	                      }
+	                 )
+           }
+
+        }
+        #if Fallback reviewer exist for approval.
+        If($ApprObj.reviewerFallback -ne '' -and ($ApprObj.ApprovalScope -eq "Multi-level" -or $ApprObj.ApprovalScope -eq "Single-level"))
+        {
+           If($ApprObj.reviewerFallback -like "*.OnMicrosoft.com")
+           {
+               # Assuming fallback reviewer is User and contains 'onmicrosoft.com'
+               $tempFBackRwr = GetObjectByName -ObjectName $ApprObj.reviewerFallback 
+               $pparam.reviewSettings.fallbackReviewers += @(
+	                      @{
+                               #Set fallback reviewer based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.singleUser"
+	                   		userId = $tempFBackRwr
+	                      }
+	                 )
+           }
+           else{
+               # Assuming fallback reviewer is Group object if it is not UPN value or Manager
+               $tempFBackRwr = GetObjectByName -ObjectName $ApprObj.reviewerFallback 
+               $pparam.reviewSettings.fallbackReviewers += @(
+	                      @{
+                               #Set fallback reviewer based on mentioned on CSV file.
+	                       	"@odata.type" = "#microsoft.graph.groupMembers"
+	                   		groupId = $tempFBackRwr
+	                      }
+	                 )
+           }
+        }
+
+
+     return $pparam
+ }
+  
+ function Log-it
+ {
+    param(
+           [string]$traceLogs
+         )
+       $traceLogs |  Out-File -FilePath "C:\Temp\scriptLogs.txt" -Append
+ }
+
+ function Log-CurrentLine
+ {
+    $currentLine = $MyInvocation.ScriptLineNumber
+    $logMessage = "Current line: $currentLine - $(Get-Date -Format 'dd-mm-yyyy HH:mm:ss')"
+    Log-it $logMessage
+ }
+ 
+ 
+ $inputFile = Import-Csv -Path "C:\Temp\IGA_Bulk_CSV_2.csv" -Delimiter "`t"
+ 
+ foreach($entry in $inputFile)
+ {
+    ######################
+    ###Define Variabled###
+    ######################
+    $catalogId = $null
+
+
+    $CatalogName = $entry.Catalog_Name
+    $CatalogDesc = $entry.Catalog_Desc
+    $tempGrpRes = $entry.GroupsResources
+    $groupRes =$tempGrpRes.split(";")
+
+    $AccessPackageName = $entry.APName
+    $AccessPackageDesc = $entry.APDesc
+    $acceptrequests = "$true"
+    $accesspkgapprovalreq = "$false"
+    $accesspkgapprovalreqext = "$false"
+    $accesspkgrequestorjustify = "$false"
+    $AccessPackagePolicyName = $entry.APPolicyName.ToString().Replace(' ','-')+"-Access-Policy"
+    $AccessPackagePolicyDesc = $entry.APPolicyDesc
+    $ApprovalScope = $entry.ApprovalLevel
+    $QueryFilter = $entry.filter
+    $reqAutoDenialDuration = $entry.ReqAutoDenialDuration
+    $AADGrpCatalogowner = $AccessPackageName.Replace(' ','-')+"-Catalog-Owner"
+    $AADGrpCatalogreader = $AccessPackageName.Replace(' ','-')+"-Catalog-Reader"
+    $AADGrpCatalogaccesspackagemanager = $AccessPackageName.Replace(' ','-')+"-Catalog-AccessPackage-Manager"
+    $AADGrpCatalogaccesspackageassignmentmanager = $AccessPackageName.Replace(' ','-')+"-Catalog-AccessPackage-Assignment-Manager"
+
+    $ApprovalObj =@{
+        approver1 = $entry.Approver1
+        approver2 = $entry.Approver2
+        defaultFallbackApprover = $entry.FallbackApprover
+        accessPolicyReviewer = $entry.Reviewer
+        ApprovalScope = $entry.ApprovalLevel
+        reviewerFallback = $entry.FallbackReviewer
+    }
+    
+     #########################
+     #### Create Catalog #####
+     #########################
+        $catalogParam = @{
+        displayName = $CatalogName
+        description = $CatalogDesc
+        isEnabled = $true
+        }
+        try
+        {
+            #check if catalog with same name already exist or not!
+            $catalogId = Get-MgEntitlementManagementCatalog -Filter "displayName eq '$CatalogName'" | select -ExpandProperty Id
+            If($catalogId -ne $null)
+            {
+                Log-CurrentLine
+                Log-it "A Record of catalog with $CatalogName already exist on this tenant."
+                Log-it "-----------------------------------------------------------------"
+            }
+            elseIf($catalogId -eq $null)
+            {
+                
+                $catalogId = New-MgEntitlementManagementCatalog -BodyParameter $catalogParam | Select -ExpandProperty Id
+
+                #Create groups based on catalog roles and Access package roles.
+                $AADGrpCatalogownerid = New-MgGroup -DisplayName $AADGrpCatalogowner -MailEnabled:$False  -MailNickName $AADGrpCatalogowner -SecurityEnabled | Select -ExpandProperty Id
+                $AADGrpCatalogreaderid  = New-MgGroup -DisplayName $AADGrpCatalogreader -MailEnabled:$False  -MailNickName $AADGrpCatalogreader -SecurityEnabled | Select -ExpandProperty Id
+                $AADGrpCatalogaccesspackagemanagerid  = New-MgGroup -DisplayName $AADGrpCatalogaccesspackagemanager -MailEnabled:$False  -MailNickName $AADGrpCatalogaccesspackagemanager -SecurityEnabled | Select -ExpandProperty Id
+                $AADGrpCatalogaccesspackageassignmentmanagerid  = New-MgGroup -DisplayName $AADGrpCatalogaccesspackageassignmentmanager  -MailEnabled:$False  -MailNickName $AADGrpCatalogaccesspackageassignmentmanager -SecurityEnabled | Select -ExpandProperty Id
+                #Allow replication time to reflect newly created groups in Entra ID for catalog.
+                Start-Sleep 60
+
+                #Assign role to groups in catalog resources.
+                $catalogownerrole = @{
+	                principalId = $AADGrpCatalogownerid
+	                roleDefinitionId = $roleidCatalogowner
+	                appScopeId = "/AccessPackageCatalog/$catalogId"
+                }
+
+                $catalogreaderrole = @{
+                     PrincipalId = "$AADGrpCatalogreaderid"
+                     RoleDefinitionId = "$roleidCatalogreader"
+                     AppScopeId = "/AccessPackageCatalog/$catalogid"
+                }
+
+                $catalogaccesspackagemanagerrole = @{
+                     PrincipalId = "$AADGrpCatalogaccesspackagemanagerid"
+                     RoleDefinitionId = "$roleidAccesspackagemanager"
+                     AppScopeId = "/AccessPackageCatalog/$catalogid"
+                 }
+ 
+                $catalogaccesspackageassignmentmanagerrole = @{
+                     PrincipalId = "$AADGrpCatalogaccesspackageassignmentmanagerid"
+                     RoleDefinitionId = "$roleidAccesspackageassignmentmanager"
+                     AppScopeId = "/AccessPackageCatalog/$catalogid"
+                 }
+                # Assign Catalog Owner Role to newly created group
+                New-MgRoleManagementEntitlementManagementRoleAssignment -BodyParameter $catalogownerrole
+                # Assign Catalog Reader role to newly created group
+                New-MgRoleManagementEntitlementManagementRoleAssignment -BodyParameter $catalogreaderrole
+                # Assign Access Package Manager Role to newly created group
+                New-MgRoleManagementEntitlementManagementRoleAssignment -BodyParameter $catalogaccesspackagemanagerrole
+                # Assign Access Pacjage assignment manager role to newly created group.
+                New-MgRoleManagementEntitlementManagementRoleAssignment -BodyParameter $catalogaccesspackageassignmentmanagerrole
+            }
+        }
+        catch
+        {
+             Log-CurrentLine
+             Logit "Reason: $_"
+             Logit "--------------------------------------------------------------------------------------"
+        }
+        
+         
+ 
+        # Add Entra ID Group to the Catalog Resource:
+        # Note: Add Service Principal as Owner of the resource to avoid an error with statement like, "The caller is not the resource owner'
+        $catalogResources = @()
+        foreach($grp in $groupRes)
+        {
+            $aadgrpid = Get-MgGroup -Filter "DisplayName eq '$grp'" | Select -ExpandProperty Id
+
+            If($aadgrpid -eq $null)
+            {
+                Log-CurrentLine
+                Log-it "Security Group : $grp , does not exist in Entra ID."
+                Log-it "--------------------------------------------------------------------------------------"
+            }
+            else
+            {
+                # Check if group is already exist in catalog resources
+                $catalogresourceid = Get-MgEntitlementManagementCatalogResource -AccessPackageCatalogId $catalogId -Filter "DisplayName eq '$grp'" -ErrorAction SilentlyContinue | Select -ExpandProperty Id
+                if($catalogresourceid -ne $null)
+                {
+                    Log-CurrentLine
+                    Log-it "Resource with the same displayName of $grp, already exist on $CatalogName catalog."
+                    Log-it "-----------------------------------------------------------------"
+                }
+                elseIf($catalogresourceid -eq $null)
+                {
+                    ############# Adding Service Principal as an owner to the resource. ############################
+                    $isCatalogexist = $false
+                    $newGroupOwner =@{
+                        "@odata.id"= "https://graph.microsoft.com/v1.0/directoryObjects/{$appServicePrincipal}"
+                    }
+                    New-MgGroupOwnerByRef -GroupId $aadgrpid -BodyParameter  $newGroupOwner -ErrorAction SilentlyContinue
+                    ################################################################################################
+           
+                    $catalogResource = @{
+                    requestType = "AdminAdd"
+                    catalog = @{
+		                id = $catalogId
+	                    }
+                        resource = @{
+		                    originId = $aadgrpid
+		                    originSystem = "AadGroup"
+	                    }
+                      }
+                      #Entra ID Group $grp has been added to the Catalog $CatalogName successfully.
+                        try{
+                                New-MgEntitlementManagementResourceRequest -BodyParameter $catalogResource | Select Id, RequestState | ConvertTo-Json
+                            }
+                        catch{
+                           Log-CurrentLine
+                           Logit "Reason: $_"
+                           Logit "--------------------------------------------------------------------------------------"
+                     }
+                     # Get Id of Entra ID Group as Catalog Resource:
+                     $catalogresourceid = Get-MgEntitlementManagementCatalogResource -AccessPackageCatalogId $catalogId -Filter "DisplayName eq '$grp'" | Select -ExpandProperty Id
+                  }
+                         
+               # Get the Origin ID of the member Resrouce  Role:
+               $catalogresourceoriginid = Get-MgEntitlementManagementCatalogResourceRole -AccessPackageCatalogId $catalogId -Filter "originSystem eq 'AadGroup' and Resource/id eq '$catalogresourceid' and DisplayName eq 'Member'" | Select -ExpandProperty OriginId
+
+               $ctlgObj=@{
+                catalogresourceid = $catalogresourceid
+                catalogresourceoriginid = $catalogresourceoriginid
+                aadgrpid = $aadgrpid
+               }
+
+               $ctlg_res = New-Object -TypeName PSObject -Property $ctlgObj
+               $catalogResources+=$ctlg_res
+            }
+
+        }
+        # Create the Access Package:
+
+        $accessPackageParams = @{
+        displayName = $AccessPackageName
+        description = $AccessPackageDesc
+        isHidden=$false
+        catalog = @{
+            id=$catalogId
+            }
+        }
+        try
+        {
+           $accesspkgid = Get-MgEntitlementManagementAccessPackage -Filter "displayName eq '$AccessPackageName'" | Select -ExpandProperty Id
+           if($accesspkgid -ne $null)
+           {
+                Log-CurrentLine
+                Log-it "Access Package with the same displayName of $AccessPackageName, already exist on $CatalogName catalog."
+                Log-it "-----------------------------------------------------------------"
+           }
+           elseIf($accesspkgid -eq $null)
+           {
+                $isAccessPkgExist = $false
+                $accesspkgid = New-MgEntitlementManagementAccessPackage -BodyParameter $accessPackageParams -Verbose | select -ExpandProperty Id
+            }
+
+        }
+        catch{
+                    Log-CurrentLine
+                    Logit "Reason: $_"
+                    Logit "--------------------------------------------------------------------------------------"
+             }
+        
+        if($isCatalogexist -eq $false -and $isAccessPkgExist -eq $false)
+        {
+            # Add Resource Role (Member Role) in Access Package:
+            foreach($res in $catalogResources)
+            {
+                $resourceRoleScope = @{
+                    role = @{
+                        originId = $res.catalogresourceoriginid
+                        displayName = "Member"
+                        originSystem = "AadGroup"
+                        resource = @{
+                            id = $res.catalogresourceid
+                            resourceType = "Security Group"
+                            originId = $aadgrpid
+                            originSystem = "AADGroup"
+                        }
+                    }
+                    scope = @{
+                        originId = $res.aadgrpid
+                        originSystem = "AADGroup"
+                        isRootScope = $true
+                    }
+                } 
+                try{
+                    New-MgEntitlementManagementAccessPackageResourceRoleScope -AccessPackageId $accesspkgid -BodyParameter $resourceRoleScope | Format-List
+                   }
+                   catch{
+                        Log-CurrentLine
+                        Logit "Reason: $_"
+                        Logit "--------------------------------------------------------------------------------------"
+                   }
+                
+            }
+        }
+        else
+        {
+            Log-CurrentLine
+            Log-it "Resource role is not assigned as roles for resources already exist on $AccessPackageName catalog."
+            Log-it "-----------------------------------------------------------------"
+        }
+        ## Create Access Package Policy:
+        $scheduleStartTime = (Get-Date).AddDays(1).ToString("yyyy-MM-dd")+"T11:59:59.998Z"
+
+        $policyParam = @{}
+        Switch($ApprovalScope)
+        {
+            "Multi-level" {
+                $policyParam = @{
+                   displayName = $AccessPackagePolicyName
+                   description = $AccessPackagePolicyDesc
+                   allowedTargetScope = "allMemberUsers" 
+                   specificAllowedTargets = @(
+	               )
+                   expiration = @{
+	            	    type = "noExpiration"
+	                }
+                   requestorSettings = @{
+	            	    enableTargetsToSelfAddAccess = $true
+	            	    enableTargetsToSelfUpdateAccess = $true
+	            	    enableTargetsToSelfRemoveAccess = $true
+	            	    allowCustomAssignmentSchedule = $false
+	            	    enableOnBehalfRequestorsToAddAccess = $false
+	            	    enableOnBehalfRequestorsToUpdateAccess = $false
+	            	    enableOnBehalfRequestorsToRemoveAccess = $false
+	            	    onBehalfRequestors = @(
+	            	    )
+	               }
+                   requestApprovalSettings = @{
+	            	isApprovalRequiredForAdd = $true
+	            	isApprovalRequiredForUpdate = $false
+	            	stages = @(
+	            		@{
+	            			durationBeforeAutomaticDenial = "P"+$reqAutoDenialDuration+"D"
+	            			isApproverJustificationRequired = $true
+	            			isEscalationEnabled = $false
+                           #it means that there is no delay before escalation occurs; the escalation happens immediately.
+	            			durationBeforeEscalation = "PT0S"
+	            			primaryApprovers = @()
+	            			fallbackPrimaryApprovers = @()
+	            			escalationApprovers = @()
+	            			fallbackEscalationApprovers = @()
+	            		}
+                       @{
+	            			durationBeforeAutomaticDenial = "P"+$reqAutoDenialDuration+"D"
+	            			isApproverJustificationRequired = $false
+	            			isEscalationEnabled = $false
+	            			#it means that there is no delay before escalation occurs; the escalation happens immediately.
+	            			durationBeforeEscalation = "PT0S"
+	            			primaryApprovers = @()
+	            			fallbackPrimaryApprovers = @()
+	            			escalationApprovers = @()
+	            			fallbackEscalationApprovers = @()
+	            		}
+	            	)
+                   }
+	                reviewSettings = @{
+	            	isEnabled = $true
+	            	expirationBehavior = "keepAccess"
+	            	isRecommendationEnabled = $true
+	            	isReviewerJustificationRequired = $true
+	            	isSelfReview = $false
+	            	schedule = @{
+	            		startDateTime = [System.DateTime]::Parse($scheduleStartTime)
+	            		expiration = @{
+	            			duration = "P"+$reqAutoDenialDuration+"D"
+	            			type = "afterDuration"
+	            		}
+	            		recurrence = @{
+	            			pattern = @{
+	            				type = "absoluteMonthly"
+	            				interval = 3
+	            				month = 0
+	            				dayOfMonth = 0
+	            				daysOfWeek = @(
+	            				)
+	            			}
+	            			range = @{
+	            				type = "noEnd"
+	            				numberOfOccurrences = 0
+	            			}
+	            		}
+	            	}
+	            	primaryReviewers = @()
+	            	fallbackReviewers = @()
+	             }
+	             accessPackage = @{
+	             	id = $accesspkgid
+	             }
+
+                }
+            }
+            "Single-level" {
+                $policyParam = @{
+                   displayName = $AccessPackagePolicyName
+                   description = $AccessPackagePolicyDesc
+                   allowedTargetScope = "allMemberUsers" 
+                   specificAllowedTargets = @(
+	               )
+                   expiration = @{
+	            	    type = "noExpiration"
+	                }
+                   requestorSettings = @{
+	            	    enableTargetsToSelfAddAccess = $true
+	            	    enableTargetsToSelfUpdateAccess = $true
+	            	    enableTargetsToSelfRemoveAccess = $true
+	            	    allowCustomAssignmentSchedule = $false
+	            	    enableOnBehalfRequestorsToAddAccess = $false
+	            	    enableOnBehalfRequestorsToUpdateAccess = $false
+	            	    enableOnBehalfRequestorsToRemoveAccess = $false
+	            	    onBehalfRequestors = @()
+	               }
+                   requestApprovalSettings = @{
+	            	isApprovalRequiredForAdd = $true
+	            	isApprovalRequiredForUpdate = $false
+	            	stages = @(
+	            		@{
+	            			durationBeforeAutomaticDenial = "P"+$reqAutoDenialDuration+"D"
+	            			isApproverJustificationRequired = $true
+	            			isEscalationEnabled = $false
+                           #it means that there is no delay before escalation occurs; the escalation happens immediately.
+	            			durationBeforeEscalation = "PT0S"
+	            			primaryApprovers = @()
+	            			fallbackPrimaryApprovers = @()
+	            			escalationApprovers = @()
+	            			fallbackEscalationApprovers = @()
+	            		}
+                     )
+                   }
+	                reviewSettings = @{
+	            	isEnabled = $true
+	            	expirationBehavior = "keepAccess"
+	            	isRecommendationEnabled = $true
+	            	isReviewerJustificationRequired = $true
+	            	isSelfReview = $false
+	            	schedule = @{
+	            		startDateTime = [System.DateTime]::Parse($scheduleStartTime)
+	            		expiration = @{
+	            			duration = "P"+$reqAutoDenialDuration+"D"
+	            			type = "afterDuration"
+	            		}
+	            		recurrence = @{
+	            			pattern = @{
+	            				type = "absoluteMonthly"
+	            				interval = 3
+	            				month = 0
+	            				dayOfMonth = 0
+	            				daysOfWeek = @(
+	            				)
+	            			}
+	            			range = @{
+	            				type = "noEnd"
+	            				numberOfOccurrences = 0
+	            			}
+	            		}
+	            	}
+	            	primaryReviewers = @(
+                            )
+	            	fallbackReviewers = @(
+	            	)
+	             }
+	             accessPackage = @{
+	             	id = $accesspkgid
+	             }
+                }
+            }
+
+            "Auto-Assigned" {
+                # Auto-Assigned Access Policy based on given query filter.
+                $policyParam = @{
+                    displayName = $AccessPackagePolicyName
+	                description = $AccessPackagePolicyDesc
+                    allowedTargetScope = "specificDirectoryUsers"
+                    specificAllowedTargets = @(
+	                	@{
+	                		"@odata.type" = "#microsoft.graph.attributeRuleMembers"
+	                		membershipRule = $QueryFilter
+	                	}
+	                )
+                    automaticRequestSettings = @{
+	                	requestAccessForAllowedTargets = $true
+	                	removeAccessWhenTargetLeavesAllowedTargets = $true
+	                	gracePeriodBeforeAccessRemoval = "P7D"
+	                }
+                    accessPackage = @{
+	             	    id = $accesspkgid
+	                }
+                }
+            }
+            default {
+                #Access Policy for Administrative Packages, where user with Access Package Assignement Manager role can assign users directly without any approval.
+                $policyParam = @{
+                    displayName = $AccessPackagePolicyName
+	                description = $AccessPackagePolicyDesc
+	                allowedTargetScope = "notSpecified"
+	                specificAllowedTargets = @(
+	                )
+                    expiration = @{
+	                	endDateTime = $null
+	                	duration = $null
+	                	type = "noExpiration"
+	                }
+                    requestorSettings = @{
+	                	enableTargetsToSelfAddAccess = $false
+	                	enableTargetsToSelfUpdateAccess = $false
+	                	enableTargetsToSelfRemoveAccess = $false
+	                	allowCustomAssignmentSchedule = $true
+	                	enableOnBehalfRequestorsToAddAccess = $false
+	                	enableOnBehalfRequestorsToUpdateAccess = $false
+	                	enableOnBehalfRequestorsToRemoveAccess = $false
+	                	onBehalfRequestors = @(
+	                	)
+	                }
+                    requestApprovalSettings = @{
+		                isApprovalRequiredForAdd = $false
+		                isApprovalRequiredForUpdate = $false
+		                stages = @(
+		                )
+	                }
+                    accessPackage = @{
+		                id = $accesspkgid
+	                }
+                }
+            }
+        }
+        try{
+                if($isCatalogexist -eq $false -and $isAccessPkgExist -eq $false)
+                {
+                    $policyParam = Get-ApproverInfo -pparam $policyParam -ApprObj $ApprovalObj
+                    New-MgEntitlementManagementAssignmentPolicy -BodyParameter $policyParam  #-ErrorAction SilentlyContinue 
+                }
+                else
+                {
+                    Log-CurrentLine
+                    Log-it "No Access Policy configured as policy $AccessPackagePolicyName with same configuration in $CatalogName and $AccessPackageName already exist in records."
+                    Log-it "-----------------------------------------------------------------"
+                }
+            }
+            catch
+            {  
+                Log-CurrentLine
+                Log-it "Reason: $_"
+                Log-it "--------------------------------------------------------------------------------------"
+            }
+            #Clear Approval Object
+            $ApprovalObj.Clear
+ }
